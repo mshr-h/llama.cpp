@@ -8,6 +8,7 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cctype>
 #include <cfloat>
@@ -838,6 +839,8 @@ private:
 
 struct llm_tokenizer_ugm : llm_tokenizer {
     llm_tokenizer_ugm(const llama_vocab & vocab, const std::vector<char> & precompiled_charsmap) {
+        byte_tokens.fill(LLAMA_TOKEN_NULL);
+
         if (precompiled_charsmap.size() > 0) {
             size_t charsmap_offset = 0;
 
@@ -875,12 +878,25 @@ struct llm_tokenizer_ugm : llm_tokenizer {
                 token_matcher.insert(token_data.text.data(), token_data.text.size(), id);
             }
 
+            if (vocab.is_byte(id)) {
+                byte_tokens[vocab.token_to_byte(id)] = id;
+            }
+
             if (vocab.is_user_defined(id)) {
                 user_defined_token_matcher.insert(token_data.text.data(), token_data.text.size());
             }
         }
 
         unknown_token_score = min_score - unknown_token_score_penalty;
+    }
+
+    bool has_byte_fallback() const {
+        for (const auto token : byte_tokens) {
+            if (token == LLAMA_TOKEN_NULL) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // escaped space symbol - U+2581 (Lower One Eighth Block)
@@ -901,6 +917,8 @@ struct llm_tokenizer_ugm : llm_tokenizer {
     float unknown_token_score;
 
     struct naive_trie token_matcher;
+
+    std::array<llama_token, 256> byte_tokens;
 };
 
 struct llm_tokenizer_ugm_session {
@@ -972,7 +990,8 @@ struct llm_tokenizer_ugm_session {
             }
 
             // if we didn't find a valid token corresponding to the whole UTF code point
-            // then use unknown token as the tokenization of this UTF code point
+            // then use unknown token as the tokenization of this UTF code point.
+            // The token is expanded to byte-fallback tokens during backtracking when available.
             if (!single_codepoint_token_found) {
                 const double challenger_score = current_best.score_sum + tokenizer.unknown_token_score;
                 prefix_offset = input_offset + n_utf8_code_units;
@@ -989,15 +1008,23 @@ struct llm_tokenizer_ugm_session {
 
         // now backtrack from the end to gather token ids of the best tokenization
         // merge sequences of consecutive unknown tokens into single unknown tokens
+        // unless byte fallback is available
         bool is_prev_unknown = false;
+        const bool byte_fallback = tokenizer.has_byte_fallback();
+        size_t tokenization_offset = input_len;
         for (struct best_tokenization & tokenization = tokenization_results[input_len]; ; tokenization = tokenization_results[tokenization.input_offset]) {
             bool is_unknown = tokenization.token_id == vocab.token_unk();
-            if (!(is_prev_unknown && is_unknown)) {
+            if (byte_fallback && is_unknown) {
+                for (size_t i = tokenization_offset; i > tokenization.input_offset; --i) {
+                    output.push_back(tokenizer.byte_tokens[static_cast<uint8_t>(normalized[i - 1])]);
+                }
+            } else if (!(is_prev_unknown && is_unknown)) {
                 output.push_back(tokenization.token_id);
             }
             if (tokenization.input_offset == 0) {
                 break;
             }
+            tokenization_offset = tokenization.input_offset;
             is_prev_unknown = is_unknown;
         }
 
@@ -1028,6 +1055,11 @@ private:
         bool processing_non_ws = false;
 
         size_t input_len = input.size();
+
+        if (shall_prepend_space && input_len > 0) {
+            normalized->append(space);
+            is_space_prepended = true;
+        }
 
         for (size_t input_offset = 0; input_offset < input_len; ) {
             auto norm_res = normalize_prefix(input, input_offset);
