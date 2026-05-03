@@ -1639,6 +1639,81 @@ class TextModel(ModelBase):
         special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
         special_vocab.add_to_gguf(self.gguf_writer)
 
+    def _has_unigram_tokenizer_json_byte_fallback(self) -> bool:
+        tokenizer_file = self.dir_model / "tokenizer.json"
+        if not tokenizer_file.is_file():
+            return False
+
+        with open(tokenizer_file, "r", encoding="utf-8") as f:
+            tokenizer_json = json.load(f)
+
+        tokenizer_model = tokenizer_json.get("model", {})
+        return tokenizer_model.get("type") == "Unigram" and tokenizer_model.get("byte_fallback") is True
+
+    def _set_vocab_unigram_tokenizer_json_byte_fallback(self) -> None:
+        tokenizer_file = self.dir_model / "tokenizer.json"
+        with open(tokenizer_file, "r", encoding="utf-8") as f:
+            tokenizer_json = json.load(f)
+
+        tokenizer_model = tokenizer_json.get("model", {})
+        if tokenizer_model.get("type") != "Unigram" or tokenizer_model.get("byte_fallback") is not True:
+            raise ValueError("expected tokenizer.json with Unigram byte-fallback model")
+
+        vocab_json = tokenizer_model["vocab"]
+        added_tokens_decoder: dict[int, dict[str, Any]] = {}
+
+        for token_data in tokenizer_json.get("added_tokens", []):
+            added_tokens_decoder[int(token_data["id"])] = token_data
+
+        tokenizer_config_file = self.dir_model / "tokenizer_config.json"
+        if tokenizer_config_file.is_file():
+            with open(tokenizer_config_file, "r", encoding="utf-8") as f:
+                tokenizer_config_json = json.load(f)
+            for token_id, token_data in tokenizer_config_json.get("added_tokens_decoder", {}).items():
+                added_tokens_decoder[int(token_id)] = token_data
+
+        vocab_size = self.hparams.get("vocab_size", len(vocab_json))
+        unk_id = tokenizer_model.get("unk_id")
+
+        tokens: list[bytes] = [f"[PAD{i}]".encode("utf-8") for i in range(vocab_size)]
+        scores: list[float] = [-10000.0] * vocab_size
+        toktypes: list[int] = [SentencePieceTokenTypes.UNUSED] * vocab_size
+
+        for token_id, (token, score) in enumerate(vocab_json):
+            if token_id >= vocab_size:
+                logger.warning(f"ignore token {token_id}: id is out of range, max={vocab_size - 1}")
+                break
+
+            if token_id == unk_id:
+                toktype = SentencePieceTokenTypes.UNKNOWN
+            elif re.fullmatch(r"<0x[0-9A-Fa-f]{2}>", token):
+                toktype = SentencePieceTokenTypes.BYTE
+            elif token_id in added_tokens_decoder and (
+                added_tokens_decoder[token_id].get("special") or self.does_token_look_special(token)
+            ):
+                toktype = SentencePieceTokenTypes.CONTROL
+            elif token_id in added_tokens_decoder:
+                toktype = SentencePieceTokenTypes.USER_DEFINED
+            else:
+                toktype = SentencePieceTokenTypes.NORMAL
+
+            tokens[token_id] = token.encode("utf-8")
+            scores[token_id] = float(score)
+            toktypes[token_id] = toktype
+
+        self.gguf_writer.add_tokenizer_model("t5")
+        self.gguf_writer.add_tokenizer_pre("default")
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_scores(scores)
+        self.gguf_writer.add_token_types(toktypes)
+        self.gguf_writer.add_add_bos_token(False)
+        self.gguf_writer.add_add_eos_token(False)
+        self.gguf_writer.add_add_space_prefix(True)
+        self.gguf_writer.add_remove_extra_whitespaces(False)
+
+        special_vocab = gguf.SpecialVocab(self.dir_model, n_vocab=len(tokens))
+        special_vocab.add_to_gguf(self.gguf_writer)
+
     def _create_vocab_sentencepiece(self):
         from sentencepiece import SentencePieceProcessor
 
@@ -2838,14 +2913,17 @@ class LlamaModel(TextModel):
         if path_tekken_json.is_file() and not path_tokenizer_json.is_file():
             self._set_vocab_mistral()
 
-        try:
-            self._set_vocab_sentencepiece()
-        except FileNotFoundError:
+        if self._has_unigram_tokenizer_json_byte_fallback():
+            self._set_vocab_unigram_tokenizer_json_byte_fallback()
+        else:
             try:
-                self._set_vocab_llama_hf()
-            except (FileNotFoundError, TypeError):
-                # Llama 3
-                self._set_vocab_gpt2()
+                self._set_vocab_sentencepiece()
+            except FileNotFoundError:
+                try:
+                    self._set_vocab_llama_hf()
+                except (FileNotFoundError, TypeError):
+                    # Llama 3
+                    self._set_vocab_gpt2()
 
         # Apply to CodeLlama only (and ignore for Llama 3 with a vocab size of 128256)
         if self.hparams.get("vocab_size", 32000) == 32016:
@@ -4769,6 +4847,10 @@ class Qwen3MoeModel(Qwen2MoeModel):
         # deal with intern-s1
         if self.origin_hf_arch == 'InternS1ForConditionalGeneration':
             self._set_vocab_interns1()
+            return
+
+        if self._has_unigram_tokenizer_json_byte_fallback():
+            self._set_vocab_unigram_tokenizer_json_byte_fallback()
             return
 
         super().set_vocab()
