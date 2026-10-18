@@ -134,6 +134,16 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+// Owned by the HTTP request; only the inference thread accesses the entries.
+struct server_image_embeddings {
+    struct entry {
+        std::string id;
+        std::vector<float> data;
+    };
+    // The offset also distinguishes slices of an image that have the same content hash.
+    std::map<size_t, entry> chunks;
+};
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -178,6 +188,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_DECISION
     // where to read the model output of each option, exactly one of the two lists is used
     struct decision {
+        std::weak_ptr<server_image_embeddings> image_embeddings;
         std::vector<llama_token> labels;       // logits of these tokens, at the last prompt token
         std::vector<int32_t>     label_groups; // if set, number of labels per output, the output is their max
         std::vector<int32_t>     markers;      // embeddings[column] at these prompt positions

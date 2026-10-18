@@ -4199,6 +4199,7 @@ private:
     bool add_prompt_mixed(server_slot & slot) {
         const auto & input_tokens = slot.task->tokens;
         const auto n_tokens_prev = batch.size();
+        const auto image_embeddings = slot.task->decision.image_embeddings.lock();
 
         while (slot.prompt.n_tokens() < slot.task->n_tokens()) {
             const auto cur_token_idx = slot.prompt.n_tokens();
@@ -4221,6 +4222,19 @@ private:
             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
 
             float * embd = slot.mbatch ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            const char * image_id = mtmd_input_chunk_get_type(chunk.get()) == MTMD_INPUT_CHUNK_TYPE_IMAGE
+                ? mtmd_input_chunk_get_id(chunk.get()) : nullptr;
+            const bool share_image = image_embeddings && image_id && image_id[0];
+            const size_t n_embd = mtmd_input_chunk_get_n_tokens(chunk.get()) * (size_t) llama_model_n_embd_inp(model_tgt);
+            bool reused = false;
+            if (share_image) {
+                auto it = image_embeddings->chunks.find(cur_token_idx);
+                if (it != image_embeddings->chunks.end() && it->second.id == image_id && it->second.data.size() == n_embd) {
+                    embd = it->second.data.data();
+                    reused = true;
+                    SLT_TRC(slot, "reuse image features at idx = %zu\n", cur_token_idx);
+                }
+            }
             if (!embd) {
                 // encode on the worker thread, so we can still handle metrics tasks
                 int32_t res = 0;
@@ -4228,6 +4242,10 @@ private:
                     res = encode_mtmd_chunk(slot, slot.mbatch, cur_token_idx);
                 });
                 embd = res == 0 ? mtmd_batch_get_output_embd(slot.mbatch.get(), chunk.get()) : nullptr;
+            }
+
+            if (embd && share_image && !reused) {
+                image_embeddings->chunks[cur_token_idx] = { image_id, std::vector<float>(embd, embd + n_embd) };
             }
 
             if (!embd || !add_mtmd_chunk(slot, chunk.get(), embd, batch)) {
@@ -5888,6 +5906,12 @@ void server_routes::init_routes() {
             return res;
         }
 
+        // Tasks keep weak references, so task_prev cannot retain features after the request ends.
+        std::shared_ptr<server_image_embeddings> image_embeddings;
+        if (decision.type == COMMON_DECISION_TYPE_LFM2_D1_OMNI && !files.empty() && questions.size() > 1) {
+            image_embeddings = std::make_shared<server_image_embeddings>();
+        }
+
         // one task per variant of each question, or one task for all the questions
         auto & rd = res->rd;
         {
@@ -5903,6 +5927,7 @@ void server_routes::init_routes() {
                         server_task task = server_task(SERVER_TASK_TYPE_DECISION);
                         task.id = rd.get_new_id();
                         decision.fill_task(state, questions, question, variant, files, ctx_server.mctx, ctx_server.init_opt, task);
+                        task.decision.image_embeddings = image_embeddings;
                         tasks.push_back(std::move(task));
                     }
                 }
