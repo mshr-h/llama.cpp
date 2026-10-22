@@ -197,6 +197,14 @@ struct server_task {
         // if set, embeddings is [q | k], and the output is instead the scaled dot product of q[pointer] and k[marker]
         int32_t                  pointer = -1;
 
+        // The HTTP request owns these buffers; completed tasks must not retain them.
+        std::map<size_t, std::weak_ptr<std::vector<float>>> image_embd;
+
+        std::shared_ptr<std::vector<float>> get_image_embd(size_t idx) const {
+            const auto it = image_embd.find(idx);
+            return it == image_embd.end() ? nullptr : it->second.lock();
+        }
+
         // first prompt position that is read, -1 if none
         int32_t pos_first() const {
             int32_t pos = pointer;
